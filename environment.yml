@@ -30,7 +30,7 @@ dependencies:
     - protobuf==3.9.1
     - requests==2.22.0
     - six==1.12.0
-    - tb-nightly==1.15.0a20190822
+    - tb-nightly==1.15.0a20190901
     - torch==1.2.0
     - torchtext==0.4.0
     - tqdm==4.34.0

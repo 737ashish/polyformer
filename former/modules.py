@@ -1,10 +1,10 @@
-from .util import mask_, d, slice_diag
+from .util import mask_, d, slice_diag, CP, CP_sparse_LU, CP_sparse_degree, CP_sparse_degree_LU
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-import random, math, sys
+import random, math
 
 class SelfAttention(nn.Module):
     """
@@ -665,9 +665,603 @@ class Attention(nn.Module):
 
         return self.unifyheads(out)
 
+class SelfAttentionSparse(nn.Module):
+    """
+    Self-attention implementation with sparse connectivity using sparse tensors.
+    Uses upper triangular matrix for keys and lower triangular matrix for queries.
+    Takes advantage of PyTorch's sparse tensor operations for better performance.
+    """
+
+    def __init__(self, emb, heads=8, mask=False, kqnorm=False, scalefactor=None):
+        """
+        :param emb: The dimension of the input and output vectors.
+        :param heads: The number of heads (parallel executions of the self-attention)
+        :param mask: Whether to apply an autoregressive mask.
+        :param kqnorm: Whether to apply layer normalization to the keys and queries.
+        :param scalefactor: Multiplier for the attention weights. If none, the default `1/sqrt(emb/heads)` is used.
+        """
+
+        super().__init__()
+
+        assert emb % heads == 0, f'Embedding dimension ({emb}) should be divisible by nr. of heads ({heads})'
+
+        self.emb = emb
+        self.heads = heads
+        self.mask = mask
+
+        s = emb // heads
+        # - We will break the embedding into `heads` chunks and feed each to a different attention head
+
+        # For values, use standard dense linear
+        self.tovalues = nn.Linear(emb, emb, bias=False)
+        self.unifyheads = nn.Linear(emb, emb)
+
+        # Create sparse weight matrices
+        # Convert mask patterns to indices and values for sparse tensors
+        
+        # Upper triangular indices and values for keys
+        indices_upper = []
+        values_upper = []
+        
+        # Lower triangular indices and values for queries
+        indices_lower = []
+        values_lower = []
+        
+        # Create indices and values based on triangular patterns
+        for i in range(emb):
+            for j in range(emb):
+                # For upper triangular (keys)
+                if j >= i:
+                    indices_upper.append([i, j])
+                    # Initialize with kaiming uniform values
+                    val = torch.empty(1).normal_(0, 0.02)[0]
+                    values_upper.append(val)
+                
+                # For lower triangular (queries)
+                if j <= i:
+                    indices_lower.append([i, j])
+                    # Initialize with kaiming uniform values
+                    val = torch.empty(1).normal_(0, 0.02)[0]
+                    values_lower.append(val)
+        
+        # Convert to tensors
+        indices_upper = torch.tensor(indices_upper).t().to(torch.long)
+        values_upper = torch.tensor(values_upper)
+        
+        indices_lower = torch.tensor(indices_lower).t().to(torch.long)
+        values_lower = torch.tensor(values_lower)
+        
+        # Create and register sparse weight matrices
+        self.register_parameter('keys_values', nn.Parameter(values_upper))
+        self.register_parameter('queries_values', nn.Parameter(values_lower))
+        
+        # Register indices as buffers (not parameters)
+        self.register_buffer('keys_indices', indices_upper)
+        self.register_buffer('queries_indices', indices_lower)
+        
+        self.kqnorm = kqnorm
+        if kqnorm:
+            self.kln = nn.LayerNorm([s])
+            self.qln = nn.LayerNorm([s])
+
+        self.scalefactor = 1/math.sqrt(emb // heads) if scalefactor is None else scalefactor
+
+    def forward(self, x):
+        b, t, e = x.size()
+        h = self.heads
+        assert e == self.emb, f'Input embedding dim ({e}) should match layer embedding dim ({self.emb})'
+
+        s = e // h
+
+        # Reshape input for sparse matrix multiplication
+        x_flat = x.reshape(-1, e)
+        
+        # Create sparse weight matrices
+        keys_weight = torch.sparse_coo_tensor(
+            self.keys_indices, self.keys_values, (e, e)
+        )
+        
+        queries_weight = torch.sparse_coo_tensor(
+            self.queries_indices, self.queries_values, (e, e)
+        )
+        
+        # Apply sparse matrix multiplications
+        keys_flat = torch.sparse.mm(keys_weight, x_flat.t()).t()
+        queries_flat = torch.sparse.mm(queries_weight, x_flat.t()).t()
+        
+        # Reshape outputs
+        keys = keys_flat.view(b, t, e)
+        queries = queries_flat.view(b, t, e)
+        
+        # Regular dense computation for values
+        values = self.tovalues(x)
+
+        # Continue with standard self-attention flow
+        keys = keys.view(b, t, h, s)
+        queries = queries.view(b, t, h, s)
+        values = values.view(b, t, h, s)
+
+        if self.kqnorm:
+            keys = self.kln(keys)
+            queries = self.qln(queries)
+
+        # Fold heads into the batch dimension
+        keys = keys.transpose(1, 2).contiguous().view(b * h, t, s)
+        queries = queries.transpose(1, 2).contiguous().view(b * h, t, s)
+        values = values.transpose(1, 2).contiguous().view(b * h, t, s)
+
+        # Compute attention
+        dot = torch.bmm(queries, keys.transpose(1, 2))
+        dot = dot * self.scalefactor
+
+        assert dot.size() == (b*h, t, t)
+
+        if self.mask: # mask out the upper half of the dot matrix, excluding the diagonal
+            mask_(dot, maskval=float('-inf'), mask_diagonal=False)
+
+        dot = F.softmax(dot, dim=2)
+        # -- dot now has row-wise self-attention probabilities
+
+        # Apply the self attention to the values
+        out = torch.bmm(dot, values).view(b, h, t, s)
+
+        # Swap h, t back, unify heads
+        out = out.transpose(1, 2).contiguous().view(b, t, s * h)
+
+        return self.unifyheads(out)
+
+class SelfAttentionSparseInPlace(nn.Module):
+    """
+    Self-attention implementation with sparse connectivity using in-place masking.
+    Uses upper triangular matrix for keys and lower triangular matrix for queries.
+    Zeroes out weights through direct modification of the weight tensor.
+    """
+
+    def __init__(self, emb, heads=8, mask=False, kqnorm=False, scalefactor=None):
+        """
+        :param emb: The dimension of the input and output vectors.
+        :param heads: The number of heads (parallel executions of the self-attention)
+        :param mask: Whether to apply an autoregressive mask.
+        :param kqnorm: Whether to apply layer normalization to the keys and queries.
+        :param scalefactor: Multiplier for the attention weights. If none, the default `1/sqrt(emb/heads)` is used.
+        """
+
+        super().__init__()
+
+        assert emb % heads == 0, f'Embedding dimension ({emb}) should be divisible by nr. of heads ({heads})'
+
+        self.emb = emb
+        self.heads = heads
+        self.mask = mask
+
+        s = emb // heads
+        # - We will break the embedding into `heads` chunks and feed each to a different attention head
+
+        # Create standard linear layers
+        self.tokeys = nn.Linear(emb, emb, bias=False)
+        self.toqueries = nn.Linear(emb, emb, bias=False)
+        self.tovalues = nn.Linear(emb, emb, bias=False)
+        self.unifyheads = nn.Linear(emb, emb)
+
+        # Create and register masks for triangular constraints
+        self.register_buffer('mask_upper', torch.triu(torch.ones(emb, emb)))
+        self.register_buffer('mask_lower', torch.tril(torch.ones(emb, emb)))
+
+        # Apply masks to weights during initialization
+        with torch.no_grad():
+            self.tokeys.weight.data.mul_(self.mask_upper)
+            self.toqueries.weight.data.mul_(self.mask_lower)
+
+        self.kqnorm = kqnorm
+        if kqnorm:
+            self.kln = nn.LayerNorm([s])
+            self.qln = nn.LayerNorm([s])
+
+        self.scalefactor = 1/math.sqrt(emb // heads) if scalefactor is None else scalefactor
+
+    def forward(self, x):
+        b, t, e = x.size()
+        h = self.heads
+        assert e == self.emb, f'Input embedding dim ({e}) should match layer embedding dim ({self.emb})'
+
+        s = e // h
+
+        # Apply masks during forward pass to ensure sparsity is maintained
+        with torch.no_grad():
+            self.tokeys.weight.data.mul_(self.mask_upper)
+            self.toqueries.weight.data.mul_(self.mask_lower)
+        
+        # Standard linear projections (with masked weights)
+        keys = self.tokeys(x)
+        queries = self.toqueries(x)
+        values = self.tovalues(x)
+
+        # Continue with standard self-attention flow
+        keys = keys.view(b, t, h, s)
+        queries = queries.view(b, t, h, s)
+        values = values.view(b, t, h, s)
+
+        if self.kqnorm:
+            keys = self.kln(keys)
+            queries = self.qln(queries)
+
+        # Fold heads into the batch dimension
+        keys = keys.transpose(1, 2).contiguous().view(b * h, t, s)
+        queries = queries.transpose(1, 2).contiguous().view(b * h, t, s)
+        values = values.transpose(1, 2).contiguous().view(b * h, t, s)
+
+        # Get dot product of queries and keys, and scale
+        dot = torch.bmm(queries, keys.transpose(1, 2))
+        dot = dot * self.scalefactor
+
+        assert dot.size() == (b*h, t, t)
+
+        if self.mask: # mask out the upper half of the dot matrix, excluding the diagonal
+            mask_(dot, maskval=float('-inf'), mask_diagonal=False)
+
+        dot = F.softmax(dot, dim=2)
+        # -- dot now has row-wise self-attention probabilities
+
+        # Apply the self attention to the values
+        out = torch.bmm(dot, values).view(b, h, t, s)
+
+        # Swap h, t back, unify heads
+        out = out.transpose(1, 2).contiguous().view(b, t, s * h)
+
+        return self.unifyheads(out)
+
+class SelfAttentionSparseGraph(nn.Module):
+    """
+    Self-attention implementation with sparse connectivity preserving the computational graph.
+    Uses upper triangular matrix for keys and lower triangular matrix for queries.
+    Applies masks during computation to avoid gradient calculation for zeroed elements.
+    """
+
+    def __init__(self, emb, heads=8, mask=False, kqnorm=False, scalefactor=None):
+        """
+        :param emb: The dimension of the input and output vectors.
+        :param heads: The number of heads (parallel executions of the self-attention)
+        :param mask: Whether to apply an autoregressive mask.
+        :param kqnorm: Whether to apply layer normalization to the keys and queries.
+        :param scalefactor: Multiplier for the attention weights. If none, the default `1/sqrt(emb/heads)` is used.
+        """
+
+        super().__init__()
+
+        assert emb % heads == 0, f'Embedding dimension ({emb}) should be divisible by nr. of heads ({heads})'
+
+        self.emb = emb
+        self.heads = heads
+        self.mask = mask
+
+        s = emb // heads
+        # - We will break the embedding into `heads` chunks and feed each to a different attention head
+
+        # Create standard linear layers
+        self.tokeys = nn.Linear(emb, emb, bias=False)
+        self.toqueries = nn.Linear(emb, emb, bias=False)
+        self.tovalues = nn.Linear(emb, emb, bias=False)
+        self.unifyheads = nn.Linear(emb, emb)
+
+        # Create and register masks for triangular constraints
+        self.register_buffer('mask_upper', torch.triu(torch.ones(emb, emb)))
+        self.register_buffer('mask_lower', torch.tril(torch.ones(emb, emb)))
+
+        self.kqnorm = kqnorm
+        if kqnorm:
+            self.kln = nn.LayerNorm([s])
+            self.qln = nn.LayerNorm([s])
+
+        self.scalefactor = 1/math.sqrt(emb // heads) if scalefactor is None else scalefactor
+
+    def forward(self, x):
+        b, t, e = x.size()
+        h = self.heads
+        assert e == self.emb, f'Input embedding dim ({e}) should match layer embedding dim ({self.emb})'
+
+        s = e // h
+
+        # Apply masks during computation while preserving the computational graph
+        effective_keys_weight = self.tokeys.weight * self.mask_upper
+        effective_queries_weight = self.toqueries.weight * self.mask_lower
+        
+        # Apply linear transformations using the masked weights
+        keys = F.linear(x, effective_keys_weight)
+        queries = F.linear(x, effective_queries_weight)
+        values = self.tovalues(x)
+
+        # Continue with standard self-attention flow
+        keys = keys.view(b, t, h, s)
+        queries = queries.view(b, t, h, s)
+        values = values.view(b, t, h, s)
+
+        if self.kqnorm:
+            keys = self.kln(keys)
+            queries = self.qln(queries)
+
+        # Fold heads into the batch dimension
+        keys = keys.transpose(1, 2).contiguous().view(b * h, t, s)
+        queries = queries.transpose(1, 2).contiguous().view(b * h, t, s)
+        values = values.transpose(1, 2).contiguous().view(b * h, t, s)
+
+        # Get dot product of queries and keys, and scale
+        dot = torch.bmm(queries, keys.transpose(1, 2))
+        dot = dot * self.scalefactor
+
+        assert dot.size() == (b*h, t, t)
+
+        if self.mask: # mask out the upper half of the dot matrix, excluding the diagonal
+            mask_(dot, maskval=float('-inf'), mask_diagonal=False)
+
+        dot = F.softmax(dot, dim=2)
+        # -- dot now has row-wise self-attention probabilities
+
+        # Apply the self attention to the values
+        out = torch.bmm(dot, values).view(b, h, t, s)
+
+        # Swap h, t back, unify heads
+        out = out.transpose(1, 2).contiguous().view(b, t, s * h)
+
+        return self.unifyheads(out)
+
+class SelfAttentionSparseCOO(nn.Module):
+    """
+    Self-attention implementation with sparse connectivity using COO sparse tensors.
+    Uses upper triangular matrix for keys and lower triangular matrix for queries.
+    Takes advantage of PyTorch's sparse tensor operations for better performance.
+    """
+
+    def __init__(self, emb, heads=8, mask=False, kqnorm=False, scalefactor=None):
+        """
+        :param emb: The dimension of the input and output vectors.
+        :param heads: The number of heads (parallel executions of the self-attention)
+        :param mask: Whether to apply an autoregressive mask.
+        :param kqnorm: Whether to apply layer normalization to the keys and queries.
+        :param scalefactor: Multiplier for the attention weights. If none, the default `1/sqrt(emb/heads)` is used.
+        """
+
+        super().__init__()
+
+        assert emb % heads == 0, f'Embedding dimension ({emb}) should be divisible by nr. of heads ({heads})'
+
+        self.emb = emb
+        self.heads = heads
+        self.mask = mask
+
+        s = emb // heads
+        # - We will break the embedding into `heads` chunks and feed each to a different attention head
+
+        # For values, use standard dense linear
+        self.tovalues = nn.Linear(emb, emb, bias=False)
+        self.unifyheads = nn.Linear(emb, emb)
+
+        # Create sparse weight matrices
+        # Convert mask patterns to indices and values for sparse tensors
+        
+        # Upper triangular indices and values for keys
+        indices_upper = []
+        values_upper = []
+        
+        # Lower triangular indices and values for queries
+        indices_lower = []
+        values_lower = []
+        
+        # Create indices and values based on triangular patterns
+        for i in range(emb):
+            for j in range(emb):
+                # For upper triangular (keys)
+                if j >= i:
+                    indices_upper.append([i, j])
+                    # Initialize with kaiming uniform values
+                    val = torch.empty(1).normal_(0, 0.02)[0]
+                    values_upper.append(val)
+                
+                # For lower triangular (queries)
+                if j <= i:
+                    indices_lower.append([i, j])
+                    # Initialize with kaiming uniform values
+                    val = torch.empty(1).normal_(0, 0.02)[0]
+                    values_lower.append(val)
+        
+        # Convert to tensors
+        indices_upper = torch.tensor(indices_upper).t().to(torch.long)
+        values_upper = torch.tensor(values_upper)
+        
+        indices_lower = torch.tensor(indices_lower).t().to(torch.long)
+        values_lower = torch.tensor(values_lower)
+        
+        # Create and register sparse weight matrices
+        self.register_parameter('keys_values', nn.Parameter(values_upper))
+        self.register_parameter('queries_values', nn.Parameter(values_lower))
+        
+        # Register indices as buffers (not parameters)
+        self.register_buffer('keys_indices', indices_upper)
+        self.register_buffer('queries_indices', indices_lower)
+        
+        self.kqnorm = kqnorm
+        if kqnorm:
+            self.kln = nn.LayerNorm([s])
+            self.qln = nn.LayerNorm([s])
+
+        self.scalefactor = 1/math.sqrt(emb // heads) if scalefactor is None else scalefactor
+
+    def forward(self, x):
+        b, t, e = x.size()
+        h = self.heads
+        assert e == self.emb, f'Input embedding dim ({e}) should match layer embedding dim ({self.emb})'
+
+        s = e // h
+
+        # Reshape input for sparse matrix multiplication
+        x_flat = x.reshape(-1, e)
+        
+        # Create sparse weight matrices
+        keys_weight = torch.sparse_coo_tensor(
+            self.keys_indices, self.keys_values, (e, e)
+        )
+        
+        queries_weight = torch.sparse_coo_tensor(
+            self.queries_indices, self.queries_values, (e, e)
+        )
+        
+        # Apply sparse matrix multiplications
+        keys_flat = torch.sparse.mm(keys_weight, x_flat.t()).t()
+        queries_flat = torch.sparse.mm(queries_weight, x_flat.t()).t()
+        
+        # Reshape outputs
+        keys = keys_flat.view(b, t, e)
+        queries = queries_flat.view(b, t, e)
+        
+        # Regular dense computation for values
+        values = self.tovalues(x)
+
+        # Continue with standard self-attention flow
+        keys = keys.view(b, t, h, s)
+        queries = queries.view(b, t, h, s)
+        values = values.view(b, t, h, s)
+
+        if self.kqnorm:
+            keys = self.kln(keys)
+            queries = self.qln(queries)
+
+        # Fold heads into the batch dimension
+        keys = keys.transpose(1, 2).contiguous().view(b * h, t, s)
+        queries = queries.transpose(1, 2).contiguous().view(b * h, t, s)
+        values = values.transpose(1, 2).contiguous().view(b * h, t, s)
+
+        # Compute attention
+        dot = torch.bmm(queries, keys.transpose(1, 2))
+        dot = dot * self.scalefactor
+
+        assert dot.size() == (b*h, t, t)
+
+        if self.mask: # mask out the upper half of the dot matrix, excluding the diagonal
+            mask_(dot, maskval=float('-inf'), mask_diagonal=False)
+
+        dot = F.softmax(dot, dim=2)
+        # -- dot now has row-wise self-attention probabilities
+
+        # Apply the self attention to the values
+        out = torch.bmm(dot, values).view(b, h, t, s)
+
+        # Swap h, t back, unify heads
+        out = out.transpose(1, 2).contiguous().view(b, t, s * h)
+
+        return self.unifyheads(out)
+
+class SelfAttentionSparseHybrid(nn.Module):
+    """
+    Self-attention implementation with sparse connectivity using a hybrid approach.
+    Uses parameter masks during initialization and computational graph masking during forward pass.
+    Provides full gradients tracking while ensuring zero weights stay zero.
+    """
+
+    def __init__(self, emb, heads=8, mask=False, kqnorm=False, scalefactor=None):
+        """
+        :param emb: The dimension of the input and output vectors.
+        :param heads: The number of heads (parallel executions of the self-attention)
+        :param mask: Whether to apply an autoregressive mask.
+        :param kqnorm: Whether to apply layer normalization to the keys and queries.
+        :param scalefactor: Multiplier for the attention weights. If none, the default `1/sqrt(emb/heads)` is used.
+        """
+
+        super().__init__()
+
+        assert emb % heads == 0, f'Embedding dimension ({emb}) should be divisible by nr. of heads ({heads})'
+
+        self.emb = emb
+        self.heads = heads
+        self.mask = mask
+
+        s = emb // heads
+        # - We will break the embedding into `heads` chunks and feed each to a different attention head
+
+        # Create raw parameters but as nn.Parameters
+        self.tokeys_weight = nn.Parameter(torch.empty(emb, emb))
+        self.toqueries_weight = nn.Parameter(torch.empty(emb, emb))
+        
+        # Standard initialization
+        nn.init.kaiming_uniform_(self.tokeys_weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.toqueries_weight, a=math.sqrt(5))
+        
+        # Regular linear layers for values and unifying heads
+        self.tovalues = nn.Linear(emb, emb, bias=False)
+        self.unifyheads = nn.Linear(emb, emb)
+
+        # Create and register masks for triangular constraints
+        self.register_buffer('mask_upper', torch.triu(torch.ones(emb, emb)))
+        self.register_buffer('mask_lower', torch.tril(torch.ones(emb, emb)))
+
+        # Apply masks to weights during initialization (just for clean initialization)
+        with torch.no_grad():
+            self.tokeys_weight.data.mul_(self.mask_upper)
+            self.toqueries_weight.data.mul_(self.mask_lower)
+
+        self.kqnorm = kqnorm
+        if kqnorm:
+            self.kln = nn.LayerNorm([s])
+            self.qln = nn.LayerNorm([s])
+
+        self.scalefactor = 1/math.sqrt(emb // heads) if scalefactor is None else scalefactor
+
+    def forward(self, x):
+        b, t, e = x.size()
+        h = self.heads
+        assert e == self.emb, f'Input embedding dim ({e}) should match layer embedding dim ({self.emb})'
+
+        s = e // h
+
+        # Apply masks while preserving the computational graph
+        effective_keys_weight = self.tokeys_weight * self.mask_upper
+        effective_queries_weight = self.toqueries_weight * self.mask_lower
+        
+        # Apply linear transformations
+        keys = F.linear(x, effective_keys_weight)
+        queries = F.linear(x, effective_queries_weight)
+        values = self.tovalues(x)
+
+        # Make sure weights remain properly masked for next time (shouldn't be needed but defensive)
+        with torch.no_grad():
+            self.tokeys_weight.data.mul_(self.mask_upper)
+            self.toqueries_weight.data.mul_(self.mask_lower)
+
+        # Continue with standard self-attention flow
+        keys = keys.view(b, t, h, s)
+        queries = queries.view(b, t, h, s)
+        values = values.view(b, t, h, s)
+
+        if self.kqnorm:
+            keys = self.kln(keys)
+            queries = self.qln(queries)
+
+        # Fold heads into the batch dimension
+        keys = keys.transpose(1, 2).contiguous().view(b * h, t, s)
+        queries = queries.transpose(1, 2).contiguous().view(b * h, t, s)
+        values = values.transpose(1, 2).contiguous().view(b * h, t, s)
+
+        # Get dot product of queries and keys, and scale
+        dot = torch.bmm(queries, keys.transpose(1, 2))
+        dot = dot * self.scalefactor
+
+        assert dot.size() == (b*h, t, t)
+
+        if self.mask: # mask out the upper half of the dot matrix, excluding the diagonal
+            mask_(dot, maskval=float('-inf'), mask_diagonal=False)
+
+        dot = F.softmax(dot, dim=2)
+        # -- dot now has row-wise self-attention probabilities
+
+        # Apply the self attention to the values
+        out = torch.bmm(dot, values).view(b, h, t, s)
+
+        # Swap h, t back, unify heads
+        out = out.transpose(1, 2).contiguous().view(b, t, s * h)
+
+        return self.unifyheads(out)
+
 class TransformerBlock(nn.Module):
     """
-    A straightforward transformer block.
+    A transformer block supporting various attention mechanisms.
     """
 
     def __init__(self, emb, heads, mask, seq_length, ff_hidden_mult=4, dropout=0.0, attention_type='default',
@@ -687,8 +1281,18 @@ class TransformerBlock(nn.Module):
         elif attention_type == 'relative':
             assert pos_embedding is not None
             self.attention = SelfAttentionRelative(emb, heads=heads, mask=mask, pos_embedding=pos_embedding)
+        elif attention_type == 'sparse':
+            self.attention = SelfAttentionSparse(emb, heads=heads, mask=mask, **sa_kwargs)
+        elif attention_type == 'sparse_inplace':
+            self.attention = SelfAttentionSparseInPlace(emb, heads=heads, mask=mask, **sa_kwargs)
+        elif attention_type == 'sparse_graph':
+            self.attention = SelfAttentionSparseGraph(emb, heads=heads, mask=mask, **sa_kwargs)
+        elif attention_type == 'sparse_coo':
+            self.attention = SelfAttentionSparseCOO(emb, heads=heads, mask=mask, **sa_kwargs)
+        elif attention_type == 'sparse_hybrid':
+            self.attention = SelfAttentionSparseHybrid(emb, heads=heads, mask=mask, **sa_kwargs)
         else:
-            raise Exception(f'Self-attention type {type} not recognized.')
+            raise Exception(f'Self-attention type {attention_type} not recognized.')
 
         self.mask = mask
 
@@ -716,6 +1320,92 @@ class TransformerBlock(nn.Module):
 
         x = self.norm2(fedforward + x)
 
+        x = self.do(x)
+
+        return x
+
+class PolyTransformerBlock(nn.Module):
+    """
+    A transformer block that uses polynomial networks instead of linear layers in the feed-forward network.
+    """
+
+    def __init__(self, emb, heads, mask, seq_length, ff_hidden_mult=4, dropout=0.0, 
+                 attention_type='default', pos_embedding=None, sa_kwargs={}, 
+                 degree=2, poly_class=CP, use_relu=True):
+        """
+        :param emb: Embedding dimension
+        :param heads: Number of attention heads
+        :param mask: Whether to use masking in self-attention
+        :param seq_length: Length of the input sequence
+        :param ff_hidden_mult: Multiplier for hidden dimension in feed-forward network
+        :param dropout: Dropout rate
+        :param attention_type: Type of self-attention to use
+        :param pos_embedding: Position embedding for relative self-attention
+        :param sa_kwargs: Additional arguments for self-attention
+        :param degree: Degree of the polynomial networks
+        :param poly_class: Which polynomial network class to use (default: CP)
+        :param use_relu: Whether to use ReLU activation between polynomial networks
+        """
+        super().__init__()
+
+        # Set up attention layer based on type (same as TransformerBlock)
+        if attention_type == 'default':
+            self.attention = SelfAttention(emb, heads=heads, mask=mask, **sa_kwargs)
+        elif attention_type == 'alt':
+            self.attention = SelfAttentionAlt(emb, heads=heads, mask=mask)
+        elif attention_type == 'wide':
+            self.attention = SelfAttentionWide(emb, heads=heads, mask=mask)
+        elif attention_type == 'gpt2':
+            self.attention = SelfAttentionGPT2(emb, heads=heads, mask=mask)
+        elif attention_type == 'narrow':
+            self.attention = SelfAttentionNarrow(emb, heads=heads, mask=mask)
+        elif attention_type == 'relative':
+            assert pos_embedding is not None
+            self.attention = SelfAttentionRelative(emb, heads=heads, mask=mask, pos_embedding=pos_embedding)
+        elif attention_type == 'sparse':
+            self.attention = SelfAttentionSparse(emb, heads=heads, mask=mask, **sa_kwargs)
+        elif attention_type == 'sparse_inplace':
+            self.attention = SelfAttentionSparseInPlace(emb, heads=heads, mask=mask, **sa_kwargs)
+        elif attention_type == 'sparse_graph':
+            self.attention = SelfAttentionSparseGraph(emb, heads=heads, mask=mask, **sa_kwargs)
+        elif attention_type == 'sparse_coo':
+            self.attention = SelfAttentionSparseCOO(emb, heads=heads, mask=mask, **sa_kwargs)
+        elif attention_type == 'sparse_hybrid':
+            self.attention = SelfAttentionSparseHybrid(emb, heads=heads, mask=mask, **sa_kwargs)
+        else:
+            raise Exception(f'Self-attention type {attention_type} not recognized.')
+
+        self.mask = mask
+        self.norm1 = nn.LayerNorm(emb)
+        self.norm2 = nn.LayerNorm(emb)
+
+        # Calculate dimensions for polynomial networks
+        input_dim = emb
+        hidden_dim = int(ff_hidden_mult * emb / degree)  # Using integer division to avoid float issues
+        
+        # Create feed-forward network with polynomial components
+        if use_relu:
+            self.ff = nn.Sequential(
+                poly_class(degree, input_dim, hidden_dim, hidden_dim),
+                nn.ReLU(),
+                poly_class(degree, hidden_dim, input_dim, input_dim)
+            )
+        else:
+            self.ff = nn.Sequential(
+                poly_class(degree, input_dim, hidden_dim, hidden_dim),
+                poly_class(degree, hidden_dim, input_dim, input_dim)
+            )
+
+        self.do = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # Same forward pass as TransformerBlock
+        attended = self.attention(x)
+        x = self.norm1(attended + x)
+        x = self.do(x)
+
+        fedforward = self.ff(x)
+        x = self.norm2(fedforward + x)
         x = self.do(x)
 
         return x
