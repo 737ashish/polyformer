@@ -5,8 +5,9 @@ from .modules import (
     SelfAttentionRelative, 
     SelfAttentionNarrow, 
     Attention,
-    PolyTransformerBlock  # Add the new class
+    PolyTransformerBlock
 )
 
 from .transformers import GTransformer, CTransformer
+from .polytransformers import PolyGTransformer, PolyCTransformer
 

@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import poly_utils as ut
+from . import poly_utils as ut
 
 
 class CP(nn.Module):

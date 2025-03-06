@@ -26,7 +26,6 @@ class GTransformer(nn.Module):
                 TransformerBlock(emb=emb, heads=heads, seq_length=seq_length, mask=True, attention_type=attention_type, pos_embedding=self.pos_embedding))
 
         self.tblocks = nn.Sequential(*tblocks)
-
         self.toprobs = nn.Linear(emb, num_tokens)
 
     def forward(self, x):

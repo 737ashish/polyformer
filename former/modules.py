@@ -1331,7 +1331,7 @@ class PolyTransformerBlock(nn.Module):
 
     def __init__(self, emb, heads, mask, seq_length, ff_hidden_mult=4, dropout=0.0, 
                  attention_type='default', pos_embedding=None, sa_kwargs={}, 
-                 degree=2, poly_class=CP, use_relu=True):
+                 degree=2, poly_class=CP, use_relu=False):
         """
         :param emb: Embedding dimension
         :param heads: Number of attention heads
@@ -1399,7 +1399,6 @@ class PolyTransformerBlock(nn.Module):
         self.do = nn.Dropout(dropout)
 
     def forward(self, x):
-        # Same forward pass as TransformerBlock
         attended = self.attention(x)
         x = self.norm1(attended + x)
         x = self.do(x)
