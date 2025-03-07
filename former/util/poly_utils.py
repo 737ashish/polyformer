@@ -44,3 +44,13 @@ def generate_masks(degree, rank, in_dim):
             M[torch.cat(steps, 0)] = 0
             Masks = Masks + [M]
     return Masks
+
+def non_zero_count(model):
+    num_param = []
+    for name, param in model.named_parameters():
+        num = torch.count_nonzero(param)
+        num_param.append(num)
+
+    count = torch.sum(torch.tensor(num_param))    
+    return count
+

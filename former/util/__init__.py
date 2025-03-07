@@ -8,5 +8,6 @@ from .polynomial_nets import CP, CP_sparse_LU, CP_sparse_degree, CP_sparse_degre
 # Import utility functions from poly_utils
 from .poly_utils import (
     generate_masks, 
-    D_U_d
+    D_U_d,
+    non_zero_count
 )

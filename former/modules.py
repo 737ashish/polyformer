@@ -1382,6 +1382,7 @@ class PolyTransformerBlock(nn.Module):
         # Calculate dimensions for polynomial networks
         input_dim = emb
         hidden_dim = int(ff_hidden_mult * emb / degree)  # Using integer division to avoid float issues
+        print(f'Hidden dimension: {hidden_dim}')
         
         # Create feed-forward network with polynomial components
         if use_relu:
@@ -1399,7 +1400,9 @@ class PolyTransformerBlock(nn.Module):
         self.do = nn.Dropout(dropout)
 
     def forward(self, x):
+        print(x.shape)
         attended = self.attention(x)
+        print(attended.shape)
         x = self.norm1(attended + x)
         x = self.do(x)
 
