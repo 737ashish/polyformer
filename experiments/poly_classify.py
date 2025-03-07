@@ -68,7 +68,8 @@ def go(arg):
         degree=arg.degree,
         poly_class=getattr(former.util, arg.poly_class),
         use_relu=arg.use_relu,
-        dropout=arg.dropout
+        dropout=arg.dropout,
+        ff_hidden_mult=arg.ff_hidden_mult  # Add this parameter
     )
     
     if torch.cuda.is_available():
@@ -242,6 +243,10 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", dest="dropout",
                         help="Dropout rate",
                         default=0.1, type=float)
+                        
+    parser.add_argument("--ff-hidden-mult", dest="ff_hidden_mult",
+                        help="Multiplier for hidden dimension in feed-forward network",
+                        default=4, type=float)
 
     options = parser.parse_args()
 
