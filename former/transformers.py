@@ -36,7 +36,8 @@ class GTransformer(nn.Module):
         tokens = self.token_embedding(x)
         b, t, e = tokens.size()
 
-        positions = self.pos_embedding(torch.arange(t, device=d()))[None, :, :].expand(b, t, e)
+        # Ensure positions tensor is on the same device as pos_embedding
+        positions = self.pos_embedding(torch.arange(t, device=self.pos_embedding.weight.device))[None, :, :].expand(b, t, e)
         x = tokens + positions
 
         x = self.tblocks(x)
@@ -87,7 +88,7 @@ class CTransformer(nn.Module):
         tokens = self.token_embedding(x)
         b, t, e = tokens.size()
 
-        positions = self.pos_embedding(torch.arange(t, device=d()))[None, :, :].expand(b, t, e)
+        positions = self.pos_embedding(torch.arange(t, device=self.pos_embedding.weight.device))[None, :, :].expand(b, t, e)
         x = tokens + positions
         x = self.do(x)
 
