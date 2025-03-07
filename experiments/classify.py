@@ -7,15 +7,14 @@ from torch import nn
 from torch.autograd import Variable
 import torch.nn.functional as F
 
-# from torchtext import data, datasets, vocab
-from torchtext.legacy import data, datasets, vocab
+from torchtext import data, datasets, vocab
 
 import numpy as np
 
 from argparse import ArgumentParser
 from torch.utils.tensorboard import SummaryWriter
 
-import random, tqdm, sys, math, gzip
+import random, tqdm, sys, math, gzip, time  # Added time for inference tracking
 
 # Used for converting between nats and bits
 LOG2E = math.log2(math.e)
@@ -60,6 +59,15 @@ def go(arg):
     model = former.CTransformer(emb=arg.embedding_size, heads=arg.num_heads, depth=arg.depth, seq_length=mx, num_tokens=arg.vocab_size, num_classes=NUM_CLS, max_pool=arg.max_pool)
     if torch.cuda.is_available():
         model.cuda()
+        
+    # Add parameter counting
+    param_count = util.non_zero_count(model)
+    print(f"Model has {param_count} non-zero parameters")
+    tbw.add_scalar('model/parameters', param_count, 0)
+    
+    # Reset GPU memory stats
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
     opt = torch.optim.Adam(lr=arg.lr, params=model.parameters())
     sch = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: min(i / (arg.lr_warmup / arg.batch_size), 1.0))
@@ -99,7 +107,10 @@ def go(arg):
         with torch.no_grad():
 
             model.train(False)
-            tot, cor= 0.0, 0.0
+            tot, cor = 0.0, 0.0
+            
+            # Track inference metrics
+            inference_times = []
 
             for batch in test_iter:
 
@@ -108,14 +119,31 @@ def go(arg):
 
                 if input.size(1) > mx:
                     input = input[:, :mx]
-                out = model(input).argmax(dim=1)
+                    
+                # Measure inference time
+                start_time = time.time()
+                out = model(input)
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                inference_times.append(time.time() - start_time)
+                
+                pred = out.argmax(dim=1)
 
                 tot += float(input.size(0))
-                cor += float((label == out).sum().item())
+                cor += float((label == pred).sum().item())
 
             acc = cor / tot
-            print(f'-- {"test" if arg.final else "validation"} accuracy {acc:.3}')
-            tbw.add_scalar('classification/test-loss', float(loss.item()), e)
+            avg_inference_time = sum(inference_times) / len(inference_times)
+            print(f'-- {"test" if arg.final else "validation"} accuracy: {acc:.3}')
+            print(f'-- avg inference time per batch: {avg_inference_time*1000:.2f} ms')
+            
+            # Log memory usage
+            if torch.cuda.is_available():
+                max_memory = torch.cuda.max_memory_allocated() / (1024 ** 2)  # MB
+                print(f'-- max GPU memory: {max_memory:.2f} MB')
+                tbw.add_scalar('system/memory_mb', max_memory, e)
+            
+            tbw.add_scalar('classification/test-accuracy', acc, e)
+            tbw.add_scalar('system/inference_time_ms', avg_inference_time * 1000, e)
 
 
 if __name__ == "__main__":
